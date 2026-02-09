@@ -15,6 +15,7 @@ from sklearn.linear_model import LogisticRegression
 # =========================
 st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="wide")
 
+
 # =========================
 # Premium + Compact CSS
 # =========================
@@ -28,18 +29,18 @@ st.markdown("""
 }
 
 /* Compact spacing */
-.block-container { padding-top: 0.8rem; padding-bottom: 0.8rem; max-width: 1200px; }
-div[data-testid="stVerticalBlock"] > div { gap: 0.55rem; }
-h1, h2, h3 { margin: 0.2rem 0 0.4rem 0; letter-spacing: -0.02em; }
+.block-container { padding-top: 0.8rem; padding-bottom: 1.0rem; max-width: 1300px; }
+div[data-testid="stVerticalBlock"] > div { gap: 0.6rem; }
+h1, h2, h3 { margin: 0.15rem 0 0.35rem 0; letter-spacing: -0.02em; }
 
 /* Cards */
 .card {
-  background: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.88);
   border: 1px solid rgba(15, 23, 42, 0.08);
-  box-shadow: 0 10px 22px rgba(2,6,23,0.06);
+  box-shadow: 0 12px 26px rgba(2,6,23,0.06);
   border-radius: 18px;
   padding: 14px 14px;
-  backdrop-filter: blur(6px);
+  backdrop-filter: blur(7px);
 }
 .card-title {
   font-size: 0.9rem;
@@ -47,9 +48,9 @@ h1, h2, h3 { margin: 0.2rem 0 0.4rem 0; letter-spacing: -0.02em; }
   margin-bottom: 0.2rem;
 }
 .big-number {
-  font-size: 2.0rem;
-  font-weight: 800;
-  margin: 0.1rem 0 0.4rem 0;
+  font-size: 2.05rem;
+  font-weight: 850;
+  margin: 0.05rem 0 0.45rem 0;
 }
 .badge {
   display:inline-block;
@@ -57,25 +58,37 @@ h1, h2, h3 { margin: 0.2rem 0 0.4rem 0; letter-spacing: -0.02em; }
   border-radius: 999px;
   font-size: 0.85rem;
   border: 1px solid rgba(15,23,42,0.10);
-  background: rgba(255,255,255,0.70);
+  background: rgba(255,255,255,0.72);
 }
-.mini { color: rgba(15,23,42,0.70); font-size: 0.9rem; }
-
-/* Sidebar */
-section[data-testid="stSidebar"]{
-  background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98));
-  border-right: 1px solid rgba(15,23,42,0.08);
+.subtle {
+  color: rgba(15,23,42,0.65);
+  font-size: 0.9rem;
 }
 
-/* Make metrics tighter */
-div[data-testid="stMetric"] > div { padding: 0.2rem 0; }
+/* Top input panel */
+.top-panel {
+  background: rgba(255,255,255,0.72);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  box-shadow: 0 10px 22px rgba(2,6,23,0.05);
+  border-radius: 18px;
+  padding: 14px 14px;
+  backdrop-filter: blur(7px);
+}
 
-/* Hide "hamburger" extra spacing sometimes */
+/* Make primary button more prominent */
+div.stButton > button[kind="primary"]{
+  width: 100%;
+  border-radius: 14px;
+  padding: 0.7rem 1rem;
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+
+/* Reduce extra padding around widgets */
+label { font-size: 0.92rem !important; }
+
+/* Hide top header whitespace */
 header { height: 0px !important; }
-
-/* Reduce expander padding if any */
-div[data-testid="stExpander"] details { padding: 0.2rem 0.2rem; }
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -173,7 +186,6 @@ def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
         if "Property Location or City" in df.columns else "Unknown"
     )
 
-    # keep only necessary columns
     keep = list(set(num_cols + cat_cols + ["sell_30d", "sell_60d_excl"]))
     keep = [c for c in keep if c in df.columns]
     df = df[keep].copy()
@@ -186,19 +198,16 @@ def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def make_location_maps(df_feat: pd.DataFrame):
     df_loc = df_feat[["state", "county", "city"]].copy()
-
     state_to_counties = (
         df_loc.groupby("state")["county"]
         .apply(lambda s: sorted(set([x for x in s if x and x != "nan"])))
         .to_dict()
     )
-
     sc_to_cities = (
         df_loc.groupby(["state", "county"])["city"]
         .apply(lambda s: sorted(set([x for x in s if x and x != "nan"])))
         .to_dict()
     )
-
     states = sorted(state_to_counties.keys())
     return states, state_to_counties, sc_to_cities
 
@@ -228,12 +237,7 @@ def train_models_and_meta():
     pipe60.fit(X60, y60)
 
     states, state_to_counties, sc_to_cities = make_location_maps(df_feat)
-
-    meta = {
-        "states": states,
-        "state_to_counties": state_to_counties,
-        "sc_to_cities": sc_to_cities,
-    }
+    meta = {"states": states, "state_to_counties": state_to_counties, "sc_to_cities": sc_to_cities}
     return pipe30, pipe60, meta
 
 
@@ -241,61 +245,80 @@ def clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
 
-def decision_label(p30: float, p60_total: float) -> str:
+def decision_text(p30: float, p60_total: float):
     if p30 >= 0.60:
-        return "Strong Buy"
+        return ("Strong Buy", "Fast flip likely (0–30 days).", "success")
     if p60_total >= 0.60:
-        return "Buy"
+        return ("Buy", "Reasonable chance within 60 days.", "success")
     if p30 >= 0.45:
-        return "Maybe"
-    return "Pass"
+        return ("Maybe", "Improve price/marketing or location.", "warning")
+    return ("Pass", "Low probability of fast sale. Re-check pricing/strategy.", "error")
 
 
 # =========================
-# Load models
+# Header
 # =========================
 st.markdown("## Cash Sales Velocity Predictor")
-st.markdown('<span class="badge">Prompt-free • Client inputs → prediction</span>', unsafe_allow_html=True)
+st.markdown('<span class="badge">Inputs on top • One-click prediction • Clean output</span>', unsafe_allow_html=True)
 
 with st.spinner("Loading & training models..."):
     pipe30, pipe60, meta = train_models_and_meta()
 
 
 # =========================
-# Sidebar inputs
+# TOP INPUT BAR (instead of left sidebar)
 # =========================
-st.sidebar.markdown("## Inputs")
+st.markdown('<div class="top-panel">', unsafe_allow_html=True)
 
-total_purchase_price = st.sidebar.number_input("Total Purchase Price", min_value=0.0, value=15000.0, step=500.0)
-acres = st.sidebar.number_input("Acres", min_value=0.0, value=1.0, step=0.01)
+c1, c2, c3, c4, c5, c6 = st.columns([1.2, 0.9, 0.9, 1.2, 1.2, 1.1], gap="medium")
 
-purchase_month = st.sidebar.selectbox("Purchase Month", list(range(1, 13)), index=0)
-sale_month = st.sidebar.selectbox("Expected Sale Month", list(range(1, 13)), index=0)
+with c1:
+    total_purchase_price = st.number_input("Total Purchase Price", min_value=0.0, value=15000.0, step=500.0)
 
-st.sidebar.markdown("### Marketing")
-promo_confirmed = st.sidebar.checkbox("Promo Confirmed", value=False)
-listed_yes = st.sidebar.checkbox("Listed", value=False)
-has_photos = st.sidebar.checkbox("Photos", value=False)
-has_drone = st.sidebar.checkbox("Drone", value=False)
-marketing_score = int(promo_confirmed) + int(listed_yes) + int(has_photos) + int(has_drone)
+with c2:
+    acres = st.number_input("Acres", min_value=0.0, value=1.0, step=0.01)
 
-st.sidebar.markdown("### Location")
+with c3:
+    purchase_month = st.selectbox("Purchase Month", list(range(1, 13)), index=0)
+
+with c4:
+    sale_month = st.selectbox("Expected Sale Month", list(range(1, 13)), index=0)
+
+# Location dependent dropdowns
 states = meta["states"] if meta["states"] else ["Unknown"]
-state = st.sidebar.selectbox("State", states, index=0)
-
+with c5:
+    state = st.selectbox("State", states, index=0)
 counties = meta["state_to_counties"].get(state, ["Unknown"])
-county = st.sidebar.selectbox("County", counties, index=0)
+with c6:
+    county = st.selectbox("County", counties, index=0)
+
+# City row + marketing + predict
+c7, c8, c9, c10, c11, c12 = st.columns([1.4, 0.9, 0.9, 0.9, 0.9, 1.1], gap="medium")
 
 cities = meta["sc_to_cities"].get((state, county), ["Unknown"])
-city = st.sidebar.selectbox("City", cities, index=0)
+with c7:
+    city = st.selectbox("City", cities, index=0)
 
-predict_btn = st.sidebar.button("Predict", type="primary")
+with c8:
+    promo_confirmed = st.checkbox("Promo", value=False)
+with c9:
+    listed_yes = st.checkbox("Listed", value=False)
+with c10:
+    has_photos = st.checkbox("Photos", value=False)
+with c11:
+    has_drone = st.checkbox("Drone", value=False)
+
+marketing_score = int(promo_confirmed) + int(listed_yes) + int(has_photos) + int(has_drone)
+
+with c12:
+    predict_btn = st.button("🚀 Predict Now", type="primary")
+
+st.markdown('</div>', unsafe_allow_html=True)
 
 
 # =========================
-# Main output (one frame)
+# OUTPUT AREA (under button)
 # =========================
-# Calculate immediately after click
 if predict_btn:
     X_in = pd.DataFrame([{
         "Total Purchase Price": float(total_purchase_price),
@@ -313,41 +336,44 @@ if predict_btn:
     p31_60 = clamp01((1.0 - p30) * p60_cond)
     p_le_60 = clamp01(p30 + p31_60)
 
-    tag = decision_label(p30, p_le_60)
+    tag, msg, level = decision_text(p30, p_le_60)
 
+    st.write("")
     st.markdown("### Prediction")
-    c1, c2, c3 = st.columns(3, gap="large")
 
-    with c1:
+    a, b, c = st.columns(3, gap="large")
+
+    with a:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("<div class='card-title'>0–30 days</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card-title'>Chance to sell in 0–30 days</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='big-number'>{p30*100:.1f}%</div>", unsafe_allow_html=True)
         st.progress(p30)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with c2:
+    with b:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("<div class='card-title'>31–60 days (additional)</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card-title'>Additional chance in 31–60 days</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='big-number'>{p31_60*100:.1f}%</div>", unsafe_allow_html=True)
         st.progress(p31_60)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with c3:
+    with c:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("<div class='card-title'>≤ 60 days (total)</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card-title'>Total chance within 60 days (approx.)</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='big-number'>{p_le_60*100:.1f}%</div>", unsafe_allow_html=True)
         st.progress(p_le_60)
         st.markdown("</div>", unsafe_allow_html=True)
 
+    st.write("")
     st.markdown("### Decision")
-    if tag == "Strong Buy":
-        st.success("Strong Buy — Fast flip likely (0–30 days).")
-    elif tag == "Buy":
-        st.success("Buy — Reasonable chance to sell within 60 days.")
-    elif tag == "Maybe":
-        st.warning("Maybe — Improve price/marketing or location.")
+    if level == "success":
+        st.success(f"{tag} — {msg}")
+    elif level == "warning":
+        st.warning(f"{tag} — {msg}")
     else:
-        st.error("Pass — Low probability of fast sale. Re-check pricing/strategy.")
+        st.error(f"{tag} — {msg}")
+
+    st.caption("Note: ≤60 = (0–30) + (31–60). 31–60 is estimated from a conditional model (approx.).")
 
 else:
-    st.info("Set inputs in the sidebar and click **Predict**.")
+    st.info("Fill inputs above and click **🚀 Predict Now**.")
