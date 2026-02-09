@@ -1,7 +1,5 @@
 streamlit
 pandas
-openpyxl
-numpy
-pydeck
-plotly
 scikit-learn
+openpyxl
+requests
