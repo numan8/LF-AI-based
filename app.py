@@ -1,578 +1,277 @@
-import re
-import numpy as np
+import os
+import io
+import requests
 import pandas as pd
+import numpy as np
 import streamlit as st
-import pydeck as pdk
-import plotly.express as px
-import plotly.graph_objects as go
 
-from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report
 
 
 # =========================
-# Config
+# Streamlit Config
 # =========================
-st.set_page_config(page_title="Cash Sale Velocity (AI Stats)", layout="wide")
+st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="centered")
 
-DATA_PATH = "Cash Sales - AI Stats.xlsx"   # keep this file in repo root
-SHEET_NAME = 0  # first sheet
 
-# Token-free basemap (works on Streamlit Cloud without MAPBOX token)
-CARTO_BASEMAP = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+# =========================
+# Data URL (GitHub)
+# =========================
+# Put your file raw/blob link here OR set env var DATA_URL on Streamlit Cloud
+DEFAULT_DATA_URL = "https://raw.githubusercontent.com/<USER>/<REPO>/main/Cash%20Sales%20-%20AI%20Stats.xlsx"
+DATA_URL = os.getenv("DATA_URL", DEFAULT_DATA_URL)
+
+
+# =========================
+# Feature columns (must match training)
+# =========================
+num_cols = ["Total Purchase Price", "Acres", "marketing_score", "purchase_month", "sale_month"]
+cat_cols = ["state", "county", "city"]
 
 
 # =========================
 # Helpers
 # =========================
-def _clean_money(x):
-    """Convert money-ish values to float safely."""
-    if pd.isna(x):
-        return np.nan
-    if isinstance(x, (int, float, np.number)):
-        return float(x)
-    s = str(x).strip()
-    s = s.replace(",", "")
-    s = re.sub(r"[^0-9.\-]", "", s)
-    if s in ("", ".", "-"):
-        return np.nan
-    try:
-        return float(s)
-    except:
-        return np.nan
-
-
-def extract_latlon(text):
-    """
-    Extract lat/lon from strings like:
-    'Center of Lot, GPS Coordinates: 34.707235, -118.147...'
-    Returns (lat, lon) or (nan, nan)
-    """
-    if pd.isna(text):
-        return (np.nan, np.nan)
-    s = str(text)
-
-    m = re.search(
-        r"GPS\s*Coordinates?\s*:\s*([-+]?\d{1,2}\.\d+)\s*,\s*([-+]?\d{1,3}\.\d+)",
-        s, re.IGNORECASE
-    )
-    if m:
-        return (float(m.group(1)), float(m.group(2)))
-
-    # fallback: any "<lat>, <lon>" pair
-    m2 = re.search(r"([-+]?\d{1,2}\.\d+)\s*,\s*([-+]?\d{1,3}\.\d+)", s)
-    if m2:
-        lat = float(m2.group(1))
-        lon = float(m2.group(2))
-        if -90 <= lat <= 90 and -180 <= lon <= 180:
-            return (lat, lon)
-
-    return (np.nan, np.nan)
-
-
-def safe_float_range(series, fallback=(0.0, 1.0)):
-    """Clean (min,max) float range for Streamlit sliders. Handles NaN/inf and degenerate ranges."""
-    if series is None:
-        return fallback
-
-    s = pd.to_numeric(series, errors="coerce")
-    s = s.replace([np.inf, -np.inf], np.nan).dropna()
-
-    if len(s) == 0:
-        return fallback
-
-    lo = float(s.min())
-    hi = float(s.max())
-
-    # widen if collapsed range
-    if lo == hi:
-        eps = 0.01 if lo != 0 else 0.1
-        lo -= eps
-        hi += eps
-
-    if not np.isfinite(lo) or not np.isfinite(hi):
-        return fallback
-    if lo > hi:
-        lo, hi = hi, lo
-
-    return (lo, hi)
-
-
-def safe_int_range(series, fallback=(0, 365)):
-    """Same as safe_float_range but returns ints for an int slider."""
-    lo, hi = safe_float_range(series, (float(fallback[0]), float(fallback[1])))
-    return (int(np.floor(lo)), int(np.ceil(hi)))
+def to_github_raw(url: str) -> str:
+    # Convert GitHub blob link -> raw link
+    # https://github.com/user/repo/blob/main/file.xlsx
+    # -> https://raw.githubusercontent.com/user/repo/main/file.xlsx
+    if "github.com" in url and "/blob/" in url:
+        url = url.replace("https://github.com/", "https://raw.githubusercontent.com/")
+        url = url.replace("/blob/", "/")
+    return url
 
 
 @st.cache_data(show_spinner=False)
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name=SHEET_NAME, engine="openpyxl")
+def load_excel_from_url(url: str) -> pd.DataFrame:
+    url = to_github_raw(url)
 
-    # Dates
-    for c in ["PURCHASE DATE", "SALE DATE - start", "Total New Money Sale Date"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce")
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/octet-stream",
+    }
 
-    # Numeric fields
-    money_cols = [
-        "Purchase Price - amount",
-        "Title Escrow Cost - amount",
-        "Taxes We Paid - amount",
-        "Total Purchase Price",
-        "Cash Sales Price - amount",
-        "Market Price - amount",
-    ]
-    for c in money_cols:
-        if c in df.columns:
-            df[c] = df[c].apply(_clean_money)
+    r = requests.get(url, headers=headers, timeout=45)
+    if r.status_code != 200:
+        st.error(
+            f"❌ Could not download Excel file.\n\n"
+            f"HTTP {r.status_code}\n\n"
+            f"URL used:\n{url}\n\n"
+            f"Fix:\n"
+            f"1) Ensure file is public\n"
+            f"2) Ensure URL points to the file (raw)\n"
+            f"3) Ensure correct branch/path\n"
+        )
+        st.stop()
 
-    if "Acres" in df.columns:
-        df["Acres"] = df["Acres"].apply(_clean_money)
-
-    # Canonical date columns
-    df["purchase_date"] = df["PURCHASE DATE"] if "PURCHASE DATE" in df.columns else pd.NaT
-    df["sale_date"] = df["SALE DATE - start"] if "SALE DATE - start" in df.columns else pd.NaT
-    df["days_to_sell"] = (df["sale_date"] - df["purchase_date"]).dt.days
-
-    # Prices
-    df["cash_sale_price"] = df["Cash Sales Price - amount"] if "Cash Sales Price - amount" in df.columns else np.nan
-    df["total_purchase_price"] = df["Total Purchase Price"] if "Total Purchase Price" in df.columns else np.nan
-
-    # Markup / profit
-    df["gross_profit"] = df["cash_sale_price"] - df["total_purchase_price"]
-    df["markup_multiple"] = (df["cash_sale_price"] / df["total_purchase_price"]).replace([np.inf, -np.inf], np.nan)
-    df.loc[df["total_purchase_price"] <= 0, "markup_multiple"] = np.nan  # extra guard
-
-    # Commissions (your rule)
-    df["acq_agent_commission"] = 0.04 * df["gross_profit"]
-    df["sales_agent_commission"] = 0.04 * df["gross_profit"]
-    df["affiliate_commission"] = 0.10 * df["cash_sale_price"]
-    df["net_profit"] = df["gross_profit"] - df["acq_agent_commission"] - df["sales_agent_commission"] - df["affiliate_commission"]
-    df["net_margin_on_purchase"] = df["net_profit"] / df["total_purchase_price"]
-
-    # Targets
-    df["sell_30d"] = (df["days_to_sell"] <= 30).astype("float")
-    df["sell_60d"] = (df["days_to_sell"] <= 60).astype("float")
-
-    # Location strings
-    df["county_state"] = df["County, State"].astype(str) if "County, State" in df.columns else ""
-    df["city"] = df["Property Location or City"].astype(str) if "Property Location or City" in df.columns else ""
-
-    # Extract GPS from "Directions to Property Below"
-    if "Directions to Property Below" in df.columns:
-        latlon = df["Directions to Property Below"].apply(extract_latlon)
-        df["lat"] = latlon.apply(lambda x: x[0])
-        df["lon"] = latlon.apply(lambda x: x[1])
-    else:
-        df["lat"] = np.nan
-        df["lon"] = np.nan
-
-    # Ensure string types for filters
-    if "Status" in df.columns:
-        df["Status"] = df["Status"].astype(str)
-    if "Sale Type (Push to Closing)" in df.columns:
-        df["Sale Type (Push to Closing)"] = df["Sale Type (Push to Closing)"].astype(str)
-
+    data = io.BytesIO(r.content)
+    df = pd.read_excel(data, engine="openpyxl")
     return df
 
 
-def bin_success_curve(df, x_col, y_col, bins=12):
-    d = df[[x_col, y_col]].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(d) < 30:
-        return None
-    d = d.sort_values(x_col)
-    d["bin"] = pd.qcut(d[x_col], q=bins, duplicates="drop")
-    g = d.groupby("bin", observed=True).agg(
-        x_mid=(x_col, "median"),
-        rate=(y_col, "mean"),
-        n=(y_col, "size"),
-    ).reset_index(drop=True)
-    return g
-
-
-def train_prob_model(df, target_col):
-    candidate_features = [
-        "markup_multiple",
-        "Acres",
-        "total_purchase_price",
-        "cash_sale_price",
-        "Market Price - amount",
-        "county_state",
-        "city",
-        "Zoning",
-        "Water",
-        "Road",
-        "Power",
-    ]
-    features = [c for c in candidate_features if c in df.columns]
-    d = df[features + [target_col]].copy()
-
-    d = d.replace([np.inf, -np.inf], np.nan)
-    d = d.dropna(subset=[target_col, "markup_multiple", "total_purchase_price", "cash_sale_price"])
-
-    if len(d) < 120:
-        return None
-
-    X = d[features]
-    y = d[target_col].astype(int)
-
-    num_cols = [c for c in features if pd.api.types.is_numeric_dtype(d[c])]
-    cat_cols = [c for c in features if c not in num_cols]
-
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline(steps=[
-                ("imp", SimpleImputer(strategy="median")),
-                ("sc", StandardScaler())
-            ]), num_cols),
-            ("cat", Pipeline(steps=[
-                ("imp", SimpleImputer(strategy="most_frequent")),
-                ("oh", OneHotEncoder(handle_unknown="ignore"))
-            ]), cat_cols),
-        ],
-        remainder="drop"
-    )
-
-    pipe = Pipeline(steps=[
-        ("pre", pre),
-        ("clf", LogisticRegression(max_iter=2000, class_weight="balanced"))
+def build_preprocess():
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
     ])
-
-    strat = y if y.nunique() > 1 else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=strat
-    )
-
-    pipe.fit(X_train, y_train)
-
-    p = pipe.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, p) if y_test.nunique() > 1 else np.nan
-
-    yhat = (p >= 0.5).astype(int)
-    cm = confusion_matrix(y_test, yhat)
-    report = classification_report(y_test, yhat, output_dict=False)
-
-    return {"pipe": pipe, "auc": auc, "cm": cm, "report": report, "n": len(d)}
-
-
-# =========================
-# Load
-# =========================
-df = load_data(DATA_PATH)
-
-st.title("Cash Sale Velocity Dashboard (AI Stats)")
-st.caption("Goal: maximize probability of selling in ≤30 or ≤60 days while keeping margins healthy (velocity of money / compounding cycles).")
-
-# KPI summary
-colA, colB, colC, colD = st.columns(4)
-with colA:
-    st.metric("Rows", f"{len(df):,}")
-with colB:
-    st.metric("Median Days to Sell", f"{int(np.nanmedian(df['days_to_sell'])) if df['days_to_sell'].notna().any() else '—'}")
-with colC:
-    st.metric("Median Markup Multiple", f"{np.nanmedian(df['markup_multiple']):.2f}" if df["markup_multiple"].notna().any() else "—")
-with colD:
-    st.metric("Sell ≤30d Base Rate", f"{np.nanmean(df['sell_30d']):.2%}" if df["sell_30d"].notna().any() else "—")
-
-
-# =========================
-# Sidebar filters
-# =========================
-st.sidebar.header("Filters")
-
-# Status
-status_sel = None
-if "Status" in df.columns:
-    status_vals = sorted(df["Status"].dropna().unique().tolist())
-    default_status = [s for s in status_vals if "SOLD" in s.upper()] or status_vals
-    status_sel = st.sidebar.multiselect("Status", status_vals, default=default_status)
-
-# Sale type
-sale_type_sel = None
-if "Sale Type (Push to Closing)" in df.columns:
-    sale_type_vals = sorted(df["Sale Type (Push to Closing)"].dropna().unique().tolist())
-    default_sale_type = [s for s in sale_type_vals if "CASH" in s.upper()] or sale_type_vals
-    sale_type_sel = st.sidebar.multiselect("Sale Type", sale_type_vals, default=default_sale_type)
-
-# Slider ranges (robust)
-ac_min, ac_max = safe_float_range(df.get("Acres"), (0.0, 10.0))
-pp_min, pp_max = safe_float_range(df.get("total_purchase_price"), (0.0, 100000.0))
-mk_min, mk_max = safe_float_range(df.get("markup_multiple"), (0.5, 5.0))
-d_min, d_max = safe_int_range(df.get("days_to_sell"), (0, 365))
-
-acres_rng = st.sidebar.slider("Acres", float(ac_min), float(ac_max), (float(ac_min), float(ac_max)))
-pp_rng = st.sidebar.slider("Total Purchase Price", float(pp_min), float(pp_max), (float(pp_min), float(pp_max)))
-
-# ✅ This slider is where your error was — now hardened
-mk_rng = st.sidebar.slider(
-    "Markup Multiple (sale / total purchase)",
-    min_value=float(mk_min),
-    max_value=float(mk_max),
-    value=(float(mk_min), float(mk_max)),
-)
-
-days_rng = st.sidebar.slider("Days to Sell", int(d_min), int(d_max), (int(d_min), int(d_max)))
-
-county_vals = sorted(df["county_state"].dropna().unique().tolist()) if "county_state" in df.columns else []
-county_sel = st.sidebar.multiselect("County, State", county_vals, default=[])
-
-weight_mode = st.sidebar.selectbox(
-    "Map Heat Weight",
-    [
-        "More weight = faster sale (1/days)",
-        "More weight = higher markup multiple",
-        "More weight = higher net profit",
-        "More weight = higher cash sale price",
-    ],
-    index=0
-)
-
-# Apply filters
-dff = df.copy()
-if status_sel is not None:
-    dff = dff[dff["Status"].isin(status_sel)]
-if sale_type_sel is not None:
-    dff = dff[dff["Sale Type (Push to Closing)"].isin(sale_type_sel)]
-
-# numeric filters
-dff = dff.replace([np.inf, -np.inf], np.nan)
-
-if "Acres" in dff.columns:
-    dff = dff[(dff["Acres"] >= acres_rng[0]) & (dff["Acres"] <= acres_rng[1])]
-
-dff = dff[
-    (dff["total_purchase_price"] >= pp_rng[0]) & (dff["total_purchase_price"] <= pp_rng[1]) &
-    (dff["markup_multiple"] >= mk_rng[0]) & (dff["markup_multiple"] <= mk_rng[1]) &
-    (dff["days_to_sell"] >= days_rng[0]) & (dff["days_to_sell"] <= days_rng[1])
-]
-
-if county_sel:
-    dff = dff[dff["county_state"].isin(county_sel)]
-
-map_df = dff.dropna(subset=["lat", "lon"]).copy()
-
-
-# =========================
-# Tabs
-# =========================
-tab1, tab2, tab3 = st.tabs(["🗺️ Map (Heat)", "🎯 Sweet Spot (30/60 days)", "📋 Data Explorer"])
-
-
-# =========================
-# TAB 1: Map
-# =========================
-with tab1:
-    st.subheader("Map: where fast cash sales happen (filter-driven heat)")
-
-    if len(map_df) == 0:
-        st.warning("No rows have usable GPS coordinates after filters. Make sure 'Directions to Property Below' contains GPS coordinates.")
-    else:
-        if weight_mode.startswith("More weight = faster"):
-            w = 1.0 / (map_df["days_to_sell"].clip(lower=1))
-        elif "markup" in weight_mode:
-            w = map_df["markup_multiple"]
-        elif "net profit" in weight_mode:
-            w = map_df["net_profit"].fillna(0)
-        else:
-            w = map_df["cash_sale_price"]
-
-        map_df["weight"] = pd.to_numeric(w, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0)
-
-        center_lat = float(map_df["lat"].median())
-        center_lon = float(map_df["lon"].median())
-
-        # Safer tooltip fields (avoid missing columns / weird names)
-        pts = map_df.copy()
-        pts["t_city"] = pts.get("city", "")
-        pts["t_county"] = pts.get("county_state", "")
-        pts["t_days"] = pd.to_numeric(pts["days_to_sell"], errors="coerce").fillna(-1).astype(int)
-        pts["t_markup"] = pd.to_numeric(pts["markup_multiple"], errors="coerce").round(2)
-        pts["t_purchase"] = pd.to_numeric(pts["total_purchase_price"], errors="coerce").round(2)
-        pts["t_sale"] = pd.to_numeric(pts["cash_sale_price"], errors="coerce").round(2)
-        pts["t_net_profit"] = pd.to_numeric(pts["net_profit"], errors="coerce").round(2)
-
-        heat_layer = pdk.Layer(
-            "HeatmapLayer",
-            data=pts,
-            get_position=["lon", "lat"],
-            get_weight="weight",
-            radius_pixels=55,
-            intensity=1.2,
-            threshold=0.02,
-        )
-
-        point_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=pts,
-            get_position=["lon", "lat"],
-            get_radius=120,
-            pickable=True,
-            opacity=0.65,
-        )
-
-        tooltip = {
-            "html": """
-            <b>{t_city}</b><br/>
-            {t_county}<br/>
-            Days: <b>{t_days}</b><br/>
-            Markup: <b>{t_markup}x</b><br/>
-            Purchase: <b>${t_purchase}</b><br/>
-            Sale: <b>${t_sale}</b><br/>
-            Net Profit (after comm): <b>${t_net_profit}</b>
-            """,
-            "style": {"backgroundColor": "white", "color": "black"},
-        }
-
-        view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=7, pitch=0)
-
-        st.pydeck_chart(
-            pdk.Deck(
-                map_style=CARTO_BASEMAP,
-                initial_view_state=view,
-                layers=[heat_layer, point_layer],
-                tooltip=tooltip,
-            )
-        )
-
-        st.caption(f"Mappable rows: {len(map_df):,} (of {len(dff):,} after filters)")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Sell ≤30d rate", f"{map_df['sell_30d'].mean():.2%}")
-        c2.metric("Sell ≤60d rate", f"{map_df['sell_60d'].mean():.2%}")
-        c3.metric("Median days", f"{int(map_df['days_to_sell'].median())}")
-        c4.metric("Median markup", f"{map_df['markup_multiple'].median():.2f}x")
-
-
-# =========================
-# TAB 2: Sweet Spot
-# =========================
-with tab2:
-    st.subheader("Sweet spot: markup multiple vs probability of selling fast")
-
-    curve30 = bin_success_curve(dff, "markup_multiple", "sell_30d", bins=12)
-    curve60 = bin_success_curve(dff, "markup_multiple", "sell_60d", bins=12)
-
-    if curve30 is None or curve60 is None:
-        st.warning("Not enough clean rows to draw stable curves. Need more rows with days_to_sell + prices.")
-    else:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=curve30["x_mid"], y=curve30["rate"],
-            mode="lines+markers", name="P(sell ≤ 30 days)",
-            hovertemplate="Markup=%{x:.2f}x<br/>Rate=%{y:.2%}<br/>n=%{text}",
-            text=curve30["n"]
-        ))
-        fig.add_trace(go.Scatter(
-            x=curve60["x_mid"], y=curve60["rate"],
-            mode="lines+markers", name="P(sell ≤ 60 days)",
-            hovertemplate="Markup=%{x:.2f}x<br/>Rate=%{y:.2%}<br/>n=%{text}",
-            text=curve60["n"]
-        ))
-        fig.update_layout(
-            xaxis_title="Markup Multiple (cash_sale_price / total_purchase_price)",
-            yaxis_title="Observed Probability",
-            yaxis_tickformat=".0%",
-            height=420,
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        target_rate_30 = st.slider("Target success rate for ≤30d", 0.10, 0.95, 0.60, 0.05)
-        target_rate_60 = st.slider("Target success rate for ≤60d", 0.10, 0.99, 0.80, 0.05)
-
-        best30 = curve30[curve30["rate"] >= target_rate_30].sort_values("x_mid")
-        best60 = curve60[curve60["rate"] >= target_rate_60].sort_values("x_mid")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if len(best30) == 0:
-                st.error("No markup band hits your ≤30d target rate (with current filters).")
-            else:
-                sweet_30 = float(best30["x_mid"].max())
-                st.success(f"Sweet spot (≤30d @ ≥{target_rate_30:.0%}): **up to ~{sweet_30:.2f}x markup**")
-
-        with col2:
-            if len(best60) == 0:
-                st.error("No markup band hits your ≤60d target rate (with current filters).")
-            else:
-                sweet_60 = float(best60["x_mid"].max())
-                st.success(f"Sweet spot (≤60d @ ≥{target_rate_60:.0%}): **up to ~{sweet_60:.2f}x markup**")
-
-    st.divider()
-    st.subheader("Model-based probability (quick ML)")
-
-    with st.spinner("Training models for ≤30d and ≤60d..."):
-        m30 = train_prob_model(dff, "sell_30d")
-        m60 = train_prob_model(dff, "sell_60d")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("#### Model: Sell ≤ 30 Days")
-        if m30 is None:
-            st.info("Not enough clean rows to train a stable model (need ~120+ clean).")
-        else:
-            st.write(f"Rows used: **{m30['n']:,}** | AUC: **{m30['auc']:.3f}**")
-            st.code(m30["report"])
-            st.write(pd.DataFrame(m30["cm"], index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"]))
-
-    with c2:
-        st.markdown("#### Model: Sell ≤ 60 Days")
-        if m60 is None:
-            st.info("Not enough clean rows to train a stable model (need ~120+ clean).")
-        else:
-            st.write(f"Rows used: **{m60['n']:,}** | AUC: **{m60['auc']:.3f}**")
-            st.code(m60["report"])
-            st.write(pd.DataFrame(m60["cm"], index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"]))
-
-    st.divider()
-    st.markdown(
-        """
-**How to use this for velocity-of-money decisions**
-- Treat **markup multiple** as your main pricing lever.
-- Pick a target: e.g., **≥60–70% sell ≤30 days** (aggressive) or **≥80–90% sell ≤60 days** (standard).
-- Cap markup at the **highest** value that still hits the target in your curve.
-- Use the **map** to see where you can stretch markup without losing speed (county/city differences matter).
-        """
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, num_cols),
+            ("cat", categorical_transformer, cat_cols),
+        ]
     )
 
 
-# =========================
-# TAB 3: Data Explorer
-# =========================
-with tab3:
-    st.subheader("Explore filtered rows")
+def prepare_training_frame(df: pd.DataFrame):
+    df = df.copy()
 
-    cols_show = [
-        "county_state", "city", "Acres",
-        "total_purchase_price", "cash_sale_price",
-        "days_to_sell", "markup_multiple",
-        "gross_profit", "net_profit", "net_margin_on_purchase",
-        "purchase_date", "sale_date"
-    ]
-    cols_show = [c for c in cols_show if c in dff.columns]
+    # ---------- Targets ----------
+    df["PURCHASE DATE"] = pd.to_datetime(df.get("PURCHASE DATE"), errors="coerce")
+    df["SALE DATE - start"] = pd.to_datetime(df.get("SALE DATE - start"), errors="coerce")
+    df["Days_to_sell_cash"] = (df["SALE DATE - start"] - df["PURCHASE DATE"]).dt.days
 
-    st.dataframe(
-        dff[cols_show].sort_values("days_to_sell", ascending=True),
-        use_container_width=True,
-        height=520
+    df = df[df["Days_to_sell_cash"].notna()].copy()
+    df = df[df["Days_to_sell_cash"] >= 0].copy()
+
+    df["sell_30d"] = (df["Days_to_sell_cash"] <= 30).astype(int)
+    df["sell_60d_excl"] = ((df["Days_to_sell_cash"] > 30) & (df["Days_to_sell_cash"] <= 60)).astype(int)
+
+    # ---------- Months ----------
+    df["purchase_month"] = df["PURCHASE DATE"].dt.month
+    df["sale_month"] = df["SALE DATE - start"].dt.month
+
+    # ---------- Numerics ----------
+    df["Total Purchase Price"] = pd.to_numeric(df.get("Total Purchase Price"), errors="coerce")
+    df["Acres"] = pd.to_numeric(df.get("Acres"), errors="coerce")
+
+    # ---------- Marketing Score ----------
+    listing_col = None
+    for c in df.columns:
+        if str(c).strip().lower() in ["listing", "land id link listing", "link listing"]:
+            listing_col = c
+            break
+
+    df["promo_confirmed"] = (
+        df["Promo Price Status"].astype(str).str.lower().str.contains("confirmed").astype(int)
+        if "Promo Price Status" in df.columns else 0
     )
 
-    st.markdown("#### Markup vs Days to Sell")
-    sc = dff.dropna(subset=["markup_multiple", "days_to_sell", "total_purchase_price", "cash_sale_price"]).copy()
-    if len(sc) > 0:
-        fig2 = px.scatter(
-            sc,
-            x="markup_multiple",
-            y="days_to_sell",
-            hover_data=["county_state", "city", "total_purchase_price", "cash_sale_price", "net_profit"],
-            trendline="lowess"
-        )
-        fig2.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig2, use_container_width=True)
+    df["listed_yes"] = (
+        df[listing_col].astype(str).str.lower().str.contains("yes").astype(int)
+        if listing_col else 0
+    )
+
+    pis = df["Photographer/Inspector Status"].astype(str).str.lower() if "Photographer/Inspector Status" in df.columns else ""
+    df["has_photos"] = pis.str.contains("photo").astype(int) if "Photographer/Inspector Status" in df.columns else 0
+    df["has_drone"]  = pis.str.contains("drone").astype(int) if "Photographer/Inspector Status" in df.columns else 0
+
+    df["marketing_score"] = df[["promo_confirmed", "listed_yes", "has_photos", "has_drone"]].sum(axis=1)
+
+    # ---------- Location ----------
+    if "County, State" in df.columns:
+        df["state"] = df["County, State"].astype(str).str.split(",").str[-1].str.strip()
+        df["county"] = df["County, State"].astype(str).str.split(",").str[0].str.strip()
     else:
-        st.info("Not enough clean rows for this plot.")
+        df["state"] = "Unknown"
+        df["county"] = "Unknown"
+
+    df["city"] = df["Property Location or City"].astype(str).str.strip() if "Property Location or City" in df.columns else "Unknown"
+
+    # ---------- Train frames ----------
+    X = df[num_cols + cat_cols].copy()
+    y30 = df["sell_30d"].astype(int)
+
+    df60 = df[df["sell_30d"] == 0].copy()
+    X60 = df60[num_cols + cat_cols].copy()
+    y60 = df60["sell_60d_excl"].astype(int)
+
+    meta = {
+        "listing_col_used": listing_col,
+        "states": sorted(df["state"].dropna().unique().tolist()),
+        "counties": sorted(df["county"].dropna().unique().tolist()),
+        "cities": sorted(df["city"].dropna().unique().tolist()),
+    }
+
+    return X, y30, X60, y60, meta
+
+
+@st.cache_resource(show_spinner=False)
+def train_models(data_url: str):
+    df = load_excel_from_url(data_url)
+    X, y30, X60, y60, meta = prepare_training_frame(df)
+
+    pipe30 = Pipeline(steps=[
+        ("preprocess", build_preprocess()),
+        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
+    ])
+    pipe30.fit(X, y30)
+
+    pipe60 = Pipeline(steps=[
+        ("preprocess", build_preprocess()),
+        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
+    ])
+    pipe60.fit(X60, y60)
+
+    return pipe30, pipe60, meta
+
+
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+# =========================
+# UI
+# =========================
+st.title("Cash Sales Velocity Predictor")
+st.caption("Client inputs → instant probability + decision (no model metrics shown).")
+
+with st.expander("Data source (GitHub)", expanded=False):
+    st.write("Set an env var `DATA_URL` in Streamlit Cloud OR edit DEFAULT_DATA_URL in app.py.")
+    st.code(DATA_URL, language="text")
+
+with st.spinner("Loading & training model..."):
+    pipe30, pipe60, meta = train_models(DATA_URL)
+
+st.divider()
+st.subheader("Deal Inputs")
+
+c1, c2 = st.columns(2)
+with c1:
+    total_purchase_price = st.number_input("Total Purchase Price", min_value=0.0, value=15000.0, step=500.0)
+    acres = st.number_input("Acres", min_value=0.0, value=1.0, step=0.01)
+
+with c2:
+    purchase_month = st.selectbox("Purchase Month", list(range(1, 13)), index=0)
+    sale_month = st.selectbox("Expected Sale Month", list(range(1, 13)), index=0)
+
+st.markdown("### Marketing Signals")
+m1, m2, m3, m4 = st.columns(4)
+with m1:
+    promo_confirmed = st.checkbox("Promo Confirmed", value=False)
+with m2:
+    listed_yes = st.checkbox("Listed", value=False)
+with m3:
+    has_photos = st.checkbox("Photos", value=False)
+with m4:
+    has_drone = st.checkbox("Drone", value=False)
+
+marketing_score = int(promo_confirmed) + int(listed_yes) + int(has_photos) + int(has_drone)
+
+st.markdown("### Location")
+states = meta["states"] if meta["states"] else ["Unknown"]
+counties = meta["counties"] if meta["counties"] else ["Unknown"]
+cities = meta["cities"] if meta["cities"] else ["Unknown"]
+
+state = st.selectbox("State", states, index=0)
+county = st.selectbox("County", counties, index=0)
+city = st.selectbox("City", cities, index=0)
+
+st.divider()
+
+if st.button("Predict", type="primary"):
+    X_in = pd.DataFrame([{
+        "Total Purchase Price": total_purchase_price,
+        "Acres": acres,
+        "marketing_score": marketing_score,
+        "purchase_month": int(purchase_month),
+        "sale_month": int(sale_month),
+        "state": state,
+        "county": county,
+        "city": city,
+    }])
+
+    p30 = clamp01(float(pipe30.predict_proba(X_in)[0, 1]))
+    p60_cond = clamp01(float(pipe60.predict_proba(X_in)[0, 1]))
+
+    # Unconditional approximation for 31-60
+    p60 = clamp01((1.0 - p30) * p60_cond)
+    p_le_60 = clamp01(p30 + p60)
+
+    # Decision logic (edit thresholds as you like)
+    decision = "Pass / Re-check pricing"
+    if p30 >= 0.60:
+        decision = "Strong Buy (fast flip likely ≤30 days)"
+    elif p_le_60 >= 0.60:
+        decision = "Buy (reasonable chance ≤60 days)"
+    elif p30 >= 0.45:
+        decision = "Maybe (improve price/marketing or location)"
+
+    st.subheader("Prediction")
+    st.metric("Probability: Sell ≤ 30 Days", f"{p30*100:.1f}%")
+    st.metric("Probability: Sell in 31–60 Days", f"{p60*100:.1f}%")
+    st.metric("Probability: Sell ≤ 60 Days (approx.)", f"{p_le_60*100:.1f}%")
+
+    st.subheader("Decision")
+    st.success(decision)
+
+    st.caption(
+        "31–60 day probability is estimated from a conditional model trained only on deals that did NOT sell within 30 days."
+    )
