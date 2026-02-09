@@ -20,10 +20,33 @@ st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="centered"
 
 # =========================
 # Data URL (GitHub)
-# =========================
-# Put your file raw/blob link here OR set env var DATA_URL on Streamlit Cloud
-DEFAULT_DATA_URL = "https://raw.githubusercontent.com/<USER>/<REPO>/main/Cash%20Sales%20-%20AI%20Stats.xlsx"
-DATA_URL = os.getenv("DATA_URL", DEFAULT_DATA_URL)
+DATA_PATH = "Cash Sales - AI Stats.xlsx"
+
+@st.cache_data
+def load_excel():
+    return pd.read_excel(DATA_PATH, engine="openpyxl")
+
+
+@st.cache_resource
+def train_models():
+    df = load_excel()
+
+    X, y30, X60, y60, meta = prepare_training_frame(df)
+
+    pipe30 = Pipeline(steps=[
+        ("preprocess", build_preprocess()),
+        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
+    ])
+    pipe30.fit(X, y30)
+
+    pipe60 = Pipeline(steps=[
+        ("preprocess", build_preprocess()),
+        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
+    ])
+    pipe60.fit(X60, y60)
+
+    return pipe30, pipe60, meta
+
 
 
 # =========================
