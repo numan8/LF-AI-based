@@ -1,6 +1,8 @@
-import streamlit as st
+import os
+import io
 import pandas as pd
 import numpy as np
+import streamlit as st
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -9,34 +11,50 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 
-st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="wide")
 
-DATA_PATH = "data/Cash Sales - AI Stats.xlsx"
+# -----------------------------
+# Config
+# -----------------------------
+st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="centered")
 
-NUM_COLS = ["Total Purchase Price", "Acres", "marketing_score", "purchase_month", "sale_month"]
-CAT_COLS = ["state", "county", "city"]
+DEFAULT_DATA_URL = "https://raw.githubusercontent.com/<USER>/<REPO>/main/Cash%20Sales%20-%20AI%20Stats.xlsx"
+DATA_URL = os.getenv("DATA_URL", DEFAULT_DATA_URL)
 
-# -------------------------
-# Utilities
-# -------------------------
-def find_listing_col(df: pd.DataFrame):
-    for c in df.columns:
-        c_norm = c.strip().lower()
-        if c_norm in ["listing", "land id link listing", "link listing"]:
-            return c
-    return None
+num_cols = ["Total Purchase Price", "Acres", "marketing_score", "purchase_month", "sale_month"]
+cat_cols = ["state", "county", "city"]
 
 
-def prepare_data(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = df_raw.copy()
+# -----------------------------
+# Helpers
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_excel_from_url(url: str) -> pd.DataFrame:
+    # Works for GitHub RAW url (xlsx)
+    df = pd.read_excel(url, engine="openpyxl")
+    return df
 
-    # Required cols
-    required = ["PURCHASE DATE", "SALE DATE - start", "Total Purchase Price"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in sheet: {missing}")
 
-    # Dates + target
+def build_preprocess():
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, num_cols),
+            ("cat", categorical_transformer, cat_cols),
+        ]
+    )
+
+
+def prepare_training_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = df.copy()
+
+    # Dates / targets
     df["PURCHASE DATE"] = pd.to_datetime(df["PURCHASE DATE"], errors="coerce")
     df["SALE DATE - start"] = pd.to_datetime(df["SALE DATE - start"], errors="coerce")
     df["Days_to_sell_cash"] = (df["SALE DATE - start"] - df["PURCHASE DATE"]).dt.days
@@ -47,193 +65,174 @@ def prepare_data(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["sell_30d"] = (df["Days_to_sell_cash"] <= 30).astype(int)
     df["sell_60d_excl"] = ((df["Days_to_sell_cash"] > 30) & (df["Days_to_sell_cash"] <= 60)).astype(int)
 
+    # months
     df["purchase_month"] = df["PURCHASE DATE"].dt.month
     df["sale_month"] = df["SALE DATE - start"].dt.month
 
-    # Numeric
-    df["Total Purchase Price"] = pd.to_numeric(df["Total Purchase Price"], errors="coerce")
-    df["Acres"] = pd.to_numeric(df["Acres"], errors="coerce") if "Acres" in df.columns else np.nan
+    # numeric
+    df["Total Purchase Price"] = pd.to_numeric(df.get("Total Purchase Price"), errors="coerce")
+    df["Acres"] = pd.to_numeric(df.get("Acres"), errors="coerce")
 
-    # Marketing score
-    listing_col = find_listing_col(df)
+    # listing column detection
+    listing_col = None
+    for c in df.columns:
+        if c.strip().lower() in ["listing", "land id link listing", "link listing"]:
+            listing_col = c
+            break
 
     df["promo_confirmed"] = (
         df["Promo Price Status"].astype(str).str.lower().str.contains("confirmed").astype(int)
         if "Promo Price Status" in df.columns else 0
     )
-
     df["listed_yes"] = (
         df[listing_col].astype(str).str.lower().str.contains("yes").astype(int)
         if listing_col else 0
     )
 
-    if "Photographer/Inspector Status" in df.columns:
-        pis = df["Photographer/Inspector Status"].astype(str).str.lower()
-        df["has_photos"] = pis.str.contains("photo").astype(int)
-        df["has_drone"] = pis.str.contains("drone").astype(int)
-    else:
-        df["has_photos"] = 0
-        df["has_drone"] = 0
+    pis = df["Photographer/Inspector Status"].astype(str).str.lower() if "Photographer/Inspector Status" in df.columns else ""
+    df["has_photos"] = pis.str.contains("photo").astype(int) if "Photographer/Inspector Status" in df.columns else 0
+    df["has_drone"]  = pis.str.contains("drone").astype(int) if "Photographer/Inspector Status" in df.columns else 0
 
     df["marketing_score"] = df[["promo_confirmed", "listed_yes", "has_photos", "has_drone"]].sum(axis=1)
 
-    # Geography
+    # location split
     if "County, State" in df.columns:
-        cs = df["County, State"].astype(str)
-        df["state"] = cs.str.split(",").str[-1].str.strip().replace({"": "Unknown"})
-        df["county"] = cs.str.split(",").str[0].str.strip().replace({"": "Unknown"})
+        df["state"]  = df["County, State"].astype(str).str.split(",").str[-1].str.strip()
+        df["county"] = df["County, State"].astype(str).str.split(",").str[0].str.strip()
     else:
         df["state"] = "Unknown"
         df["county"] = "Unknown"
 
-    if "Property Location or City" in df.columns:
-        df["city"] = df["Property Location or City"].astype(str).str.strip().replace({"": "Unknown"})
-    else:
-        df["city"] = "Unknown"
+    df["city"] = df["Property Location or City"].astype(str).str.strip() if "Property Location or City" in df.columns else "Unknown"
 
-    # Ensure cols exist
-    for c in NUM_COLS:
-        if c not in df.columns:
-            df[c] = np.nan
-    for c in CAT_COLS:
-        if c not in df.columns:
-            df[c] = "Unknown"
-
-    return df
-
-
-def build_pipeline():
-    num_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-
-    cat_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
-
-    pre = ColumnTransformer([
-        ("num", num_pipe, NUM_COLS),
-        ("cat", cat_pipe, CAT_COLS)
-    ])
-
-    pipe = Pipeline([
-        ("preprocess", pre),
-        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga"))
-    ])
-    return pipe
-
-
-@st.cache_data
-def load_raw():
-    return pd.read_excel(DATA_PATH, engine="openpyxl")
-
-
-@st.cache_resource
-def train_models():
-    df_raw = load_raw()
-    df = prepare_data(df_raw)
-
-    # Model A
-    X = df[NUM_COLS + CAT_COLS]
+    # training frames
+    X = df[num_cols + cat_cols].copy()
     y30 = df["sell_30d"].astype(int)
 
-    pipe30 = build_pipeline()
-    pipe30.fit(X, y30)
-
-    # Model B: train only on not sell_30d
     df60 = df[df["sell_30d"] == 0].copy()
-    X60 = df60[NUM_COLS + CAT_COLS]
+    X60 = df60[num_cols + cat_cols].copy()
     y60 = df60["sell_60d_excl"].astype(int)
 
-    pipe60 = build_pipeline()
-    pipe60.fit(X60, y60)
-
-    # defaults for UI
-    defaults = {
-        "median_cost": float(np.nanmedian(df["Total Purchase Price"])),
-        "median_acres": float(np.nanmedian(df["Acres"])) if df["Acres"].notna().any() else 1.0,
-        "median_mkt": int(np.nanmedian(df["marketing_score"])) if df["marketing_score"].notna().any() else 0,
-        "mode_state": df["state"].mode().iloc[0] if df["state"].notna().any() else "Unknown",
-        "mode_county": df["county"].mode().iloc[0] if df["county"].notna().any() else "Unknown",
-        "mode_city": df["city"].mode().iloc[0] if df["city"].notna().any() else "Unknown",
+    meta = {
+        "listing_col_used": listing_col,
+        "states": sorted(df["state"].dropna().unique().tolist()),
+        "counties": sorted(df["county"].dropna().unique().tolist()),
+        "cities": sorted(df["city"].dropna().unique().tolist()),
     }
 
-    return pipe30, pipe60, defaults
+    return (X, y30, X60, y60, meta)
 
 
-def predict(pipe30, pipe60, row_df: pd.DataFrame):
-    p30 = float(pipe30.predict_proba(row_df)[0, 1])
-    p60_cond = float(pipe60.predict_proba(row_df)[0, 1])
-    p31_60 = (1 - p30) * p60_cond
-    p60 = p30 + p31_60
-    return p30, p60
+@st.cache_resource(show_spinner=False)
+def train_models(data_url: str):
+    df = load_excel_from_url(data_url)
+    X, y30, X60, y60, meta = prepare_training_frame(df)
+
+    # Model A
+    pipe30 = Pipeline(steps=[
+        ("preprocess", build_preprocess()),
+        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
+    ])
+    pipe30.fit(X, y30)
+
+    # Model B (trained only on NOT sell_30d)
+    pipe60 = Pipeline(steps=[
+        ("preprocess", build_preprocess()),
+        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
+    ])
+    pipe60.fit(X60, y60)
+
+    return pipe30, pipe60, meta
 
 
-# -------------------------
-# App UI (Client-facing)
-# -------------------------
+def clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+# -----------------------------
+# UI
+# -----------------------------
 st.title("Cash Sales Velocity Predictor")
-st.caption("Enter a deal scenario → get probability of selling within 30 or 60 days (cash).")
+st.caption("Client inputs → instant probability + decision (no model metrics shown).")
 
-pipe30, pipe60, defaults = train_models()
+with st.expander("Data source (GitHub)", expanded=False):
+    st.write("Set your Excel raw URL in an env var `DATA_URL` (recommended), or edit DEFAULT_DATA_URL in app.py.")
+    st.code(DATA_URL, language="text")
 
-with st.form("deal_form"):
-    st.subheader("Deal inputs")
+with st.spinner("Loading & training model..."):
+    pipe30, pipe60, meta = train_models(DATA_URL)
 
-    c1, c2, c3 = st.columns(3)
+# Input form
+st.subheader("Deal Inputs")
 
-    with c1:
-        total_cost = st.number_input(
-            "Total Purchase Price (All-in Cost)",
-            min_value=0.0,
-            value=defaults["median_cost"],
-            step=1000.0
-        )
-        acres = st.number_input(
-            "Acres",
-            min_value=0.0,
-            value=defaults["median_acres"],
-            step=0.25
-        )
+col1, col2 = st.columns(2)
+with col1:
+    total_purchase_price = st.number_input("Total Purchase Price", min_value=0.0, value=15000.0, step=500.0)
+    acres = st.number_input("Acres", min_value=0.0, value=1.0, step=0.01)
 
-    with c2:
-        marketing_score = st.slider("Marketing Score (0–4)", 0, 4, defaults["median_mkt"])
-        purchase_month = st.slider("Purchase Month", 1, 12, int(pd.Timestamp.today().month))
-        sale_month = st.slider("Expected Sale Month", 1, 12, int(pd.Timestamp.today().month))
+with col2:
+    purchase_month = st.selectbox("Purchase Month", list(range(1, 13)), index=0)
+    sale_month = st.selectbox("Expected Sale Month", list(range(1, 13)), index=0)
 
-    with c3:
-        state = st.text_input("State", value=str(defaults["mode_state"]))
-        county = st.text_input("County", value=str(defaults["mode_county"]))
-        city = st.text_input("City", value=str(defaults["mode_city"]))
+st.markdown("### Marketing Signals")
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    promo_confirmed = st.checkbox("Promo Confirmed", value=False)
+with c2:
+    listed_yes = st.checkbox("Listed", value=False)
+with c3:
+    has_photos = st.checkbox("Photos", value=False)
+with c4:
+    has_drone = st.checkbox("Drone", value=False)
 
-    submitted = st.form_submit_button("Predict")
+marketing_score = int(promo_confirmed) + int(listed_yes) + int(has_photos) + int(has_drone)
 
-if submitted:
-    row = pd.DataFrame([{
-        "Total Purchase Price": total_cost,
+st.markdown("### Location")
+# Use known categories (helps prevent unseen labels)
+state = st.selectbox("State", meta["states"] if meta["states"] else ["Unknown"])
+county = st.selectbox("County", meta["counties"] if meta["counties"] else ["Unknown"])
+city = st.selectbox("City", meta["cities"] if meta["cities"] else ["Unknown"])
+
+# Predict button
+if st.button("Predict", type="primary"):
+    X_in = pd.DataFrame([{
+        "Total Purchase Price": total_purchase_price,
         "Acres": acres,
         "marketing_score": marketing_score,
-        "purchase_month": purchase_month,
-        "sale_month": sale_month,
+        "purchase_month": int(purchase_month),
+        "sale_month": int(sale_month),
         "state": state,
         "county": county,
         "city": city,
     }])
 
-    p30, p60 = predict(pipe30, pipe60, row)
+    # P(sell <= 30d)
+    p30 = float(pipe30.predict_proba(X_in)[0, 1])
+    p30 = clamp01(p30)
+
+    # Conditional P(31-60 | not <=30)
+    p60_cond = float(pipe60.predict_proba(X_in)[0, 1])
+    p60_cond = clamp01(p60_cond)
+
+    # Convert to unconditional-ish:
+    # P(31-60) ≈ (1 - P(<=30)) * P(31-60 | not<=30)
+    p60 = clamp01((1.0 - p30) * p60_cond)
+
+    # Decision logic (simple, editable)
+    decision = "Pass / Re-check pricing"
+    if p30 >= 0.60:
+        decision = "Strong Buy (fast flip likely ≤30 days)"
+    elif (p30 < 0.60) and (p30 + p60 >= 0.60):
+        decision = "Buy (reasonable chance ≤60 days)"
+    elif p30 >= 0.45:
+        decision = "Maybe (need better markup/marketing or better area)"
 
     st.subheader("Prediction")
-    k1, k2 = st.columns(2)
-    k1.metric("Probability of selling within 30 days", f"{p30:.1%}")
-    k2.metric("Probability of selling within 60 days", f"{p60:.1%}")
+    st.metric("Probability: Sell ≤ 30 Days", f"{p30*100:.1f}%")
+    st.metric("Probability: Sell in 31–60 Days", f"{p60*100:.1f}%")
+    st.metric("Probability: Sell ≤ 60 Days (approx.)", f"{(p30+p60)*100:.1f}%")
 
-    st.info("Tip: Lower Total Purchase Price and stronger marketing score typically increases sell-fast probability.")
+    st.subheader("Decision")
+    st.success(decision)
 
-
-# Optional advanced panel (hidden by default)
-with st.expander("Advanced (optional)"):
-    st.write("This app trains 2 logistic models on historical cash sales:")
-    st.write("- Model A: sell within 30 days")
-    st.write("- Model B: sell within 31–60 days, trained only on deals that did not sell in 30 days")
+    st.caption("Note: 31–60 day probability is estimated from a conditional model trained only on deals that did NOT sell within 30 days.")
