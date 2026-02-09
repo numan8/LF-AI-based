@@ -1,6 +1,4 @@
 import os
-import io
-import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -19,39 +17,11 @@ st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="centered"
 
 
 # =========================
-# Data URL (GitHub)
+# Local Excel path (FILE IS IN SAME REPO)
+# =========================
 DATA_PATH = "Cash Sales - AI Stats.xlsx"
 
-@st.cache_data
-def load_excel():
-    return pd.read_excel(DATA_PATH, engine="openpyxl")
-
-
-@st.cache_resource
-def train_models():
-    df = load_excel()
-
-    X, y30, X60, y60, meta = prepare_training_frame(df)
-
-    pipe30 = Pipeline(steps=[
-        ("preprocess", build_preprocess()),
-        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
-    ])
-    pipe30.fit(X, y30)
-
-    pipe60 = Pipeline(steps=[
-        ("preprocess", build_preprocess()),
-        ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
-    ])
-    pipe60.fit(X60, y60)
-
-    return pipe30, pipe60, meta
-
-
-
-# =========================
-# Feature columns (must match training)
-# =========================
+# Features used by model (must match training)
 num_cols = ["Total Purchase Price", "Acres", "marketing_score", "purchase_month", "sale_month"]
 cat_cols = ["state", "county", "city"]
 
@@ -59,41 +29,16 @@ cat_cols = ["state", "county", "city"]
 # =========================
 # Helpers
 # =========================
-def to_github_raw(url: str) -> str:
-    # Convert GitHub blob link -> raw link
-    # https://github.com/user/repo/blob/main/file.xlsx
-    # -> https://raw.githubusercontent.com/user/repo/main/file.xlsx
-    if "github.com" in url and "/blob/" in url:
-        url = url.replace("https://github.com/", "https://raw.githubusercontent.com/")
-        url = url.replace("/blob/", "/")
-    return url
-
-
 @st.cache_data(show_spinner=False)
-def load_excel_from_url(url: str) -> pd.DataFrame:
-    url = to_github_raw(url)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/octet-stream",
-    }
-
-    r = requests.get(url, headers=headers, timeout=45)
-    if r.status_code != 200:
+def load_excel_local(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
         st.error(
-            f"❌ Could not download Excel file.\n\n"
-            f"HTTP {r.status_code}\n\n"
-            f"URL used:\n{url}\n\n"
-            f"Fix:\n"
-            f"1) Ensure file is public\n"
-            f"2) Ensure URL points to the file (raw)\n"
-            f"3) Ensure correct branch/path\n"
+            f"❌ Excel file not found: `{path}`\n\n"
+            f"Fix: Upload it to the GitHub repo root (same folder as app.py) "
+            f"and ensure the filename matches exactly."
         )
         st.stop()
-
-    data = io.BytesIO(r.content)
-    df = pd.read_excel(data, engine="openpyxl")
-    return df
+    return pd.read_excel(path, engine="openpyxl")
 
 
 def build_preprocess():
@@ -152,9 +97,13 @@ def prepare_training_frame(df: pd.DataFrame):
         if listing_col else 0
     )
 
-    pis = df["Photographer/Inspector Status"].astype(str).str.lower() if "Photographer/Inspector Status" in df.columns else ""
-    df["has_photos"] = pis.str.contains("photo").astype(int) if "Photographer/Inspector Status" in df.columns else 0
-    df["has_drone"]  = pis.str.contains("drone").astype(int) if "Photographer/Inspector Status" in df.columns else 0
+    if "Photographer/Inspector Status" in df.columns:
+        pis = df["Photographer/Inspector Status"].astype(str).str.lower()
+        df["has_photos"] = pis.str.contains("photo").astype(int)
+        df["has_drone"] = pis.str.contains("drone").astype(int)
+    else:
+        df["has_photos"] = 0
+        df["has_drone"] = 0
 
     df["marketing_score"] = df[["promo_confirmed", "listed_yes", "has_photos", "has_drone"]].sum(axis=1)
 
@@ -166,9 +115,12 @@ def prepare_training_frame(df: pd.DataFrame):
         df["state"] = "Unknown"
         df["county"] = "Unknown"
 
-    df["city"] = df["Property Location or City"].astype(str).str.strip() if "Property Location or City" in df.columns else "Unknown"
+    df["city"] = (
+        df["Property Location or City"].astype(str).str.strip()
+        if "Property Location or City" in df.columns else "Unknown"
+    )
 
-    # ---------- Train frames ----------
+    # Keep only model columns
     X = df[num_cols + cat_cols].copy()
     y30 = df["sell_30d"].astype(int)
 
@@ -177,7 +129,6 @@ def prepare_training_frame(df: pd.DataFrame):
     y60 = df60["sell_60d_excl"].astype(int)
 
     meta = {
-        "listing_col_used": listing_col,
         "states": sorted(df["state"].dropna().unique().tolist()),
         "counties": sorted(df["county"].dropna().unique().tolist()),
         "cities": sorted(df["city"].dropna().unique().tolist()),
@@ -187,8 +138,8 @@ def prepare_training_frame(df: pd.DataFrame):
 
 
 @st.cache_resource(show_spinner=False)
-def train_models(data_url: str):
-    df = load_excel_from_url(data_url)
+def train_models():
+    df = load_excel_local(DATA_PATH)
     X, y30, X60, y60, meta = prepare_training_frame(df)
 
     pipe30 = Pipeline(steps=[
@@ -216,12 +167,12 @@ def clamp01(x: float) -> float:
 st.title("Cash Sales Velocity Predictor")
 st.caption("Client inputs → instant probability + decision (no model metrics shown).")
 
-with st.expander("Data source (GitHub)", expanded=False):
-    st.write("Set an env var `DATA_URL` in Streamlit Cloud OR edit DEFAULT_DATA_URL in app.py.")
-    st.code(DATA_URL, language="text")
+with st.expander("Data source", expanded=False):
+    st.write("This app reads the Excel file directly from the repository:")
+    st.code(DATA_PATH, language="text")
 
 with st.spinner("Loading & training model..."):
-    pipe30, pipe60, meta = train_models(DATA_URL)
+    pipe30, pipe60, meta = train_models()
 
 st.divider()
 st.subheader("Deal Inputs")
@@ -271,14 +222,17 @@ if st.button("Predict", type="primary"):
         "city": city,
     }])
 
+    # P(sell <= 30d)
     p30 = clamp01(float(pipe30.predict_proba(X_in)[0, 1]))
+
+    # Conditional P(31-60 | not <=30)
     p60_cond = clamp01(float(pipe60.predict_proba(X_in)[0, 1]))
 
-    # Unconditional approximation for 31-60
+    # Convert to unconditional-ish:
     p60 = clamp01((1.0 - p30) * p60_cond)
     p_le_60 = clamp01(p30 + p60)
 
-    # Decision logic (edit thresholds as you like)
+    # Decision logic (edit thresholds if needed)
     decision = "Pass / Re-check pricing"
     if p30 >= 0.60:
         decision = "Strong Buy (fast flip likely ≤30 days)"
@@ -295,6 +249,4 @@ if st.button("Predict", type="primary"):
     st.subheader("Decision")
     st.success(decision)
 
-    st.caption(
-        "31–60 day probability is estimated from a conditional model trained only on deals that did NOT sell within 30 days."
-    )
+    st.caption("31–60 day probability is estimated from a conditional model trained only on deals that did NOT sell within 30 days.")
