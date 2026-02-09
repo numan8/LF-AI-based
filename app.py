@@ -17,7 +17,7 @@ st.set_page_config(page_title="Cash Sales Velocity Predictor", layout="centered"
 
 
 # =========================
-# Local Excel path (FILE IS IN SAME REPO)
+# Local Excel path (file in same repo)
 # =========================
 DATA_PATH = "Cash Sales - AI Stats.xlsx"
 
@@ -34,8 +34,7 @@ def load_excel_local(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         st.error(
             f"❌ Excel file not found: `{path}`\n\n"
-            f"Fix: Upload it to the GitHub repo root (same folder as app.py) "
-            f"and ensure the filename matches exactly."
+            f"Fix: Upload it to the GitHub repo root (same folder as app.py) and ensure the filename matches exactly."
         )
         st.stop()
     return pd.read_excel(path, engine="openpyxl")
@@ -58,10 +57,11 @@ def build_preprocess():
     )
 
 
-def prepare_training_frame(df: pd.DataFrame):
+def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create engineered features and targets; returns cleaned DF used for training + location dropdowns."""
     df = df.copy()
 
-    # ---------- Targets ----------
+    # ---------- Dates / targets ----------
     df["PURCHASE DATE"] = pd.to_datetime(df.get("PURCHASE DATE"), errors="coerce")
     df["SALE DATE - start"] = pd.to_datetime(df.get("SALE DATE - start"), errors="coerce")
     df["Days_to_sell_cash"] = (df["SALE DATE - start"] - df["PURCHASE DATE"]).dt.days
@@ -91,7 +91,6 @@ def prepare_training_frame(df: pd.DataFrame):
         df["Promo Price Status"].astype(str).str.lower().str.contains("confirmed").astype(int)
         if "Promo Price Status" in df.columns else 0
     )
-
     df["listed_yes"] = (
         df[listing_col].astype(str).str.lower().str.contains("yes").astype(int)
         if listing_col else 0
@@ -120,27 +119,51 @@ def prepare_training_frame(df: pd.DataFrame):
         if "Property Location or City" in df.columns else "Unknown"
     )
 
-    # Keep only model columns
-    X = df[num_cols + cat_cols].copy()
-    y30 = df["sell_30d"].astype(int)
+    # Keep only what's needed (avoid surprises)
+    keep_cols = list(set(num_cols + cat_cols + ["sell_30d", "sell_60d_excl"]))
+    keep_cols = [c for c in keep_cols if c in df.columns]
+    df = df[keep_cols].copy()
 
-    df60 = df[df["sell_30d"] == 0].copy()
-    X60 = df60[num_cols + cat_cols].copy()
-    y60 = df60["sell_60d_excl"].astype(int)
+    # Fill missing location as Unknown to keep dropdown consistent
+    for c in ["state", "county", "city"]:
+        if c in df.columns:
+            df[c] = df[c].fillna("Unknown").astype(str).str.strip()
 
-    meta = {
-        "states": sorted(df["state"].dropna().unique().tolist()),
-        "counties": sorted(df["county"].dropna().unique().tolist()),
-        "cities": sorted(df["city"].dropna().unique().tolist()),
-    }
+    return df
 
-    return X, y30, X60, y60, meta
+
+def make_location_maps(df_feat: pd.DataFrame):
+    """Build State -> Counties and (State, County) -> Cities mappings."""
+    # ensure strings
+    df_loc = df_feat[["state", "county", "city"]].copy()
+    df_loc["state"] = df_loc["state"].astype(str)
+    df_loc["county"] = df_loc["county"].astype(str)
+    df_loc["city"] = df_loc["city"].astype(str)
+
+    state_to_counties = (
+        df_loc.groupby("state")["county"]
+        .apply(lambda s: sorted(set([x for x in s if x and x != "nan"])))
+        .to_dict()
+    )
+
+    sc_to_cities = (
+        df_loc.groupby(["state", "county"])["city"]
+        .apply(lambda s: sorted(set([x for x in s if x and x != "nan"])))
+        .to_dict()
+    )
+
+    states = sorted(state_to_counties.keys())
+    return states, state_to_counties, sc_to_cities
 
 
 @st.cache_resource(show_spinner=False)
-def train_models():
-    df = load_excel_local(DATA_PATH)
-    X, y30, X60, y60, meta = prepare_training_frame(df)
+def train_models_and_meta():
+    raw = load_excel_local(DATA_PATH)
+    df_feat = enrich_features(raw)
+
+    # Model A: sell_30d
+    X = df_feat[num_cols + cat_cols].copy()
+    y30 = df_feat["sell_30d"].astype(int)
 
     pipe30 = Pipeline(steps=[
         ("preprocess", build_preprocess()),
@@ -148,11 +171,25 @@ def train_models():
     ])
     pipe30.fit(X, y30)
 
+    # Model B: sell_60d_excl trained only on NOT sell_30d
+    df60 = df_feat[df_feat["sell_30d"] == 0].copy()
+    X60 = df60[num_cols + cat_cols].copy()
+    y60 = df60["sell_60d_excl"].astype(int)
+
     pipe60 = Pipeline(steps=[
         ("preprocess", build_preprocess()),
         ("model", LogisticRegression(max_iter=20000, class_weight="balanced", solver="saga")),
     ])
     pipe60.fit(X60, y60)
+
+    # Location dropdown mappings
+    states, state_to_counties, sc_to_cities = make_location_maps(df_feat)
+
+    meta = {
+        "states": states,
+        "state_to_counties": state_to_counties,
+        "sc_to_cities": sc_to_cities,
+    }
 
     return pipe30, pipe60, meta
 
@@ -172,7 +209,7 @@ with st.expander("Data source", expanded=False):
     st.code(DATA_PATH, language="text")
 
 with st.spinner("Loading & training model..."):
-    pipe30, pipe60, meta = train_models()
+    pipe30, pipe60, meta = train_models_and_meta()
 
 st.divider()
 st.subheader("Deal Inputs")
@@ -200,15 +237,21 @@ with m4:
 marketing_score = int(promo_confirmed) + int(listed_yes) + int(has_photos) + int(has_drone)
 
 st.markdown("### Location")
-states = meta["states"] if meta["states"] else ["Unknown"]
-counties = meta["counties"] if meta["counties"] else ["Unknown"]
-cities = meta["cities"] if meta["cities"] else ["Unknown"]
 
-state = st.selectbox("State", states, index=0)
+states = meta["states"] if meta["states"] else ["Unknown"]
+default_state_idx = 0
+state = st.selectbox("State", states, index=default_state_idx)
+
+counties = meta["state_to_counties"].get(state, ["Unknown"])
 county = st.selectbox("County", counties, index=0)
+
+cities = meta["sc_to_cities"].get((state, county), ["Unknown"])
 city = st.selectbox("City", cities, index=0)
 
 st.divider()
+
+# Optional: simple explanation line (removes confusion)
+st.caption("Note: ≤60 days = (0–30 days) + (31–60 days). The 31–60 estimate is approximate (conditional model).")
 
 if st.button("Predict", type="primary"):
     X_in = pd.DataFrame([{
@@ -235,18 +278,16 @@ if st.button("Predict", type="primary"):
     # Decision logic (edit thresholds if needed)
     decision = "Pass / Re-check pricing"
     if p30 >= 0.60:
-        decision = "Strong Buy (fast flip likely ≤30 days)"
+        decision = "Strong Buy (fast flip likely 0–30 days)"
     elif p_le_60 >= 0.60:
-        decision = "Buy (reasonable chance ≤60 days)"
+        decision = "Buy (reasonable chance within 60 days)"
     elif p30 >= 0.45:
         decision = "Maybe (improve price/marketing or location)"
 
     st.subheader("Prediction")
-    st.metric("Probability: Sell ≤ 30 Days", f"{p30*100:.1f}%")
-    st.metric("Probability: Sell in 31–60 Days", f"{p60*100:.1f}%")
-    st.metric("Probability: Sell ≤ 60 Days (approx.)", f"{p_le_60*100:.1f}%")
+    st.metric("Chance to sell in 0–30 days", f"{p30*100:.1f}%")
+    st.metric("Additional chance in 31–60 days", f"{p60*100:.1f}%")
+    st.metric("Total chance within 60 days (approx.)", f"{p_le_60*100:.1f}%")
 
     st.subheader("Decision")
     st.success(decision)
-
-    st.caption("31–60 day probability is estimated from a conditional model trained only on deals that did NOT sell within 30 days.")
